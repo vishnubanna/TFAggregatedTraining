@@ -1,19 +1,20 @@
 import tensorflow as tf
 from tensorflow.python.keras.optimizer_v2.optimizer_v2 import OptimizerV2
 from tensorflow.python.ops import math_ops, state_ops, control_flow_ops, array_ops
-# from tensorflow.python import ops 
+from tensorflow.python import ops 
+# from tensorflow.python.keras.utils import control_flow_util
 # from tensorflow.python.keras import backend_config
 
 
 __all__ = ['SGDAccumulated']
 
-
+# problem is that sub division cannot change between saves
 class SGDAccumulated(OptimizerV2):
   """Optimizer that implements the Adam algorithm with gradient accumulation."""
 
   def __init__(self,
                 accumulation_steps = 1,
-                accumulation_type = 'sum', 
+                accumulation_type = 'mean', 
                 learning_rate=0.01,
                 momentum=0.0,
                 nesterov=False,
@@ -23,6 +24,15 @@ class SGDAccumulated(OptimizerV2):
     Args:
         accumulation_steps: An integer. Update gradient in every accumulation steps.
         learning_rate: A Tensor or a floating point value.    The learning rate.
+        beta_1: A float value or a constant float tensor. The exponential decay
+            rate for the 1st moment estimates.
+        beta_2: A float value or a constant float tensor. The exponential decay
+            rate for the 2nd moment estimates.
+        epsilon: A small constant for numerical stability. This epsilon is
+            "epsilon hat" in the Kingma and Ba paper (in the formula just before
+            Section 2.1), not the epsilon in Algorithm 1 of the paper.
+        amsgrad: boolean. Whether to apply AMSGrad variant of this algorithm from
+            the paper "On the Convergence of Adam and beyond".
         name: Optional name for the operations created when applying gradients.
             Defaults to "Adam".    @compatibility(eager) When eager execution is
             enabled, `learning_rate`, `beta_1`, `beta_2`, and `epsilon` can each be
@@ -47,6 +57,7 @@ class SGDAccumulated(OptimizerV2):
       raise ValueError("`momentum` must be between [0, 1].")
     self._set_hyper("momentum", momentum)
     self.nesterov = nesterov
+    
     self._accumulation_type = accumulation_type
 
   def _create_slots(self, var_list):
@@ -61,21 +72,68 @@ class SGDAccumulated(OptimizerV2):
     apply_state[(var_device, var_dtype)]["momentum"] = array_ops.identity(
         self._get_hyper("momentum", var_dtype))
 
+  # def momentum_update(self, coefficients, var, grad, update_cond):
+  #   momentum = coefficients["momentum"]
+  #   lr = coefficients["lr_t"]
+  #   momentum_grad = self.get_slot(var, 'momentum')
+  #   momentum_g = momentum * momentum_grad + (1 - momentum) * grad
+  #   var_update = state_ops.assign_sub(var, lr * momentum_g, use_locking=self._use_locking)
+  #   with tf.control_dependencies([momentum_g]):
+  #     momentum_g = state_ops.assign(momentum_grad, momentum_g, use_locking=self._use_locking)
+  #   return control_flow_ops.group(*[var_update, momentum_g])
+
+  # def no_momentum_update(self, coefficients, var, grad):
+  #   lr = coefficients["lr_t"]
+  #   var_update = state_ops.assign_sub(
+  #               var,
+  #               lr * grad,
+  #               use_locking=self._use_locking)
+  #   return control_flow_ops.group(*[var_update])
+  
+  def momentum_update(self, coefficients, var, grad, update_cond):
+    momentum_var = self.get_slot(var, "momentum")
+    return tf.raw_ops.ResourceApplyKerasMomentum(
+        var=var.handle,
+        accum=momentum_var.handle,
+        lr=coefficients["lr_t"],
+        grad=grad,
+        momentum=coefficients["momentum"],
+        use_locking=self._use_locking,
+        use_nesterov=self.nesterov)
+
+  def no_momentum_update(self, coefficients, var, grad):
+    return tf.raw_ops.ResourceApplyGradientDescent(
+          var=var.handle,
+          alpha=coefficients["lr_t"],
+          delta=grad,
+          use_locking=self._use_locking)
+  
+  def raw_update(self, coefficients, var, grad, update_cond):
+    def func():
+      # tf.print("up")
+      if self._momentum:
+        return self.momentum_update(coefficients, var, grad, update_cond)
+      else:
+        return self.no_momentum_update(coefficients, var, grad)
+    return func
+
+  def no_update(self, var):
+    def func():
+      # tf.print("no up")
+      var_update = state_ops.assign(var, var, use_locking=self._use_locking)
+      return control_flow_ops.group(*[var_update])
+    return func
+
   def _resource_apply_dense(self, grad, var, apply_state = None):
+    # tf.print('opt', self.iterations)
     var_device, var_dtype = var.device, var.dtype.base_dtype
     coefficients = ((apply_state or {}).get((var_device, var_dtype))
                   or self._fallback_apply_state(var_device, var_dtype))
 
-    lr_t = coefficients["lr_t"]
     accumulation_steps = self._get_hyper('accumulation_steps', 'int64')
     update_cond = tf.equal((self.iterations + 1) % accumulation_steps, 0)
-
-    # steps = 500500 * accumulation steps
     sub_step = self.iterations % accumulation_steps + 1
-    local_step = math_ops.cast(self.iterations // accumulation_steps + 1, var_dtype)
-
-    # used to control when updates happen (zero when substeps != accumulation steps)
-    lr = tf.where(update_cond, lr_t, 0.0)
+    # local_step = math_ops.cast(self.iterations // accumulation_steps + 1, var_dtype)
 
     #gradient accumulation sum
     if self._accumulation_type == 'sum':
@@ -83,39 +141,21 @@ class SGDAccumulated(OptimizerV2):
       g_a = grad 
       g_t = tf.where(tf.equal(sub_step, 1), g_a, g_a + g)
       g_t = state_ops.assign(g, g_t, use_locking=self._use_locking) 
-    elif self._accumulation_type == 'moving_avg':
-      g = self.get_slot(var, 'g') # accumulated gradient
-      g_a = grad / math_ops.cast(accumulation_steps, var_dtype)
-      g_t = tf.where(tf.equal(sub_step, 1),
-                      g_a,
-                      g + (g_a - g) / math_ops.cast(sub_step, var_dtype))
-      g_t = state_ops.assign(g, g_t, use_locking=self._use_locking)
     else:
       g = self.get_slot(var, 'g') # accumulated gradient
       g_a = grad / math_ops.cast(accumulation_steps, var_dtype)
       g_t = tf.where(tf.equal(sub_step, 1), g_a, g_a + g)
       g_t = state_ops.assign(g, g_t, use_locking=self._use_locking)
 
-    # momentum update
-    if self._momentum:
-      momentum = coefficients["momentum"]
-      momentum_grad = self.get_slot(var, 'momentum')
-      momentum_g = tf.where(update_cond, momentum * momentum_grad + (1 - momentum) * g_t , momentum_grad)
-      var_update = state_ops.assign_sub(var, lr * momentum_g, use_locking=self._use_locking)
-      with tf.control_dependencies([momentum_g]):
-        momentum_g = state_ops.assign(momentum_grad, momentum_g, use_locking=self._use_locking)
-      return control_flow_ops.group(*[var_update, momentum_g])
-    # nestrov momentum
-    # standard update
-    else:
-      var_update = state_ops.assign_sub(
-                var,
-                lr * g_t,
-                use_locking=self._use_locking)
-      return control_flow_ops.group(*[var_update])
+    updates = tf.cond(update_cond, 
+                                true_fn = self.raw_update(coefficients, var, g_t, update_cond), 
+                                false_fn = self.no_update(var))
+    return updates
+
 
   def _resource_apply_sparse(self, grad, var, indices, apply_state=None):
     # This method is only needed for momentum optimization.
+
     var_device, var_dtype = var.device, var.dtype.base_dtype
     coefficients = ((apply_state or {}).get((var_device, var_dtype))
                     or self._fallback_apply_state(var_device, var_dtype))
@@ -139,6 +179,7 @@ class SGDAccumulated(OptimizerV2):
                     g + (g_a - g) / math_ops.cast(sub_step, var_dtype))
     g_t = state_ops.assign(g, g_t, use_locking=self._use_locking)
     
+    
 
     # momentum update
     momentum = coefficients["momentum"]
@@ -147,7 +188,6 @@ class SGDAccumulated(OptimizerV2):
     var_update = state_ops.assign_sub(var, lr * momuentum_grad, use_locking=self._use_locking)
     momuentum_grad = state_ops.assign(momuentum_g, momuentum_grad, use_locking=self._use_locking)
     return control_flow_ops.group(*[var_update, momuentum_grad])
-    # nestrov momentum
 
 
   def get_config(self):
@@ -161,17 +201,17 @@ class SGDAccumulated(OptimizerV2):
     return config
 
 
-if __name__ == "__main__":
-  from yolo import run
-  import os
-  optimizer = SGDAccumulated(accumulation_steps = 8)
+# if __name__ == "__main__":
+#   from yolo import run
+#   import os
+#   optimizer = SGDAccumulated(accumulation_steps = 8)
 
-  config = [os.path.abspath('yolo/configs/experiments/yolov4-eval.yaml')]
-  model_dir = "" #os.path.abspath("../checkpoints/yolo_dt8_norm_iou")
+#   config = [os.path.abspath('yolo/configs/experiments/yolov4-eval.yaml')]
+#   model_dir = "" #os.path.abspath("../checkpoints/yolo_dt8_norm_iou")
 
-  task, model, params = run.load_model(experiment='yolo_custom', config_path=config, model_dir=model_dir)
+#   task, model, params = run.load_model(experiment='yolo_custom', config_path=config, model_dir=model_dir)
 
-  train_data = task.build_inputs(task.task_config.train_data)
-  validation_data = task.build_inputs(task.task_config.train_data)
+#   train_data = task.build_inputs(task.task_config.train_data)
+#   validation_data = task.build_inputs(task.task_config.train_data)
   
-  model.compile(optimizer = optimizer)
+#   model.compile(optimizer = optimizer)
